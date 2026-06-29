@@ -4,33 +4,54 @@ const cors = require("cors");
 const http = require("http");
 const { Server } = require("socket.io");
 const path = require("path");
+const fs = require("fs");
 const ExcelJS = require("exceljs");
+
+// Node >=18 required for global fetch
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 
-// INISIALISASI FIREBASE
-const serviceAccount = require("./serviceAccountKey.json");
+// SERVICE_ACCOUNT_PATH can be provided via env to avoid committing credentials
+const SERVICE_ACCOUNT_PATH = process.env.SERVICE_ACCOUNT_PATH || path.join(__dirname, "serviceAccountKey.json");
+if (!fs.existsSync(SERVICE_ACCOUNT_PATH)) {
+  console.error("ERROR: service account file not found at", SERVICE_ACCOUNT_PATH);
+  console.error("Set SERVICE_ACCOUNT_PATH env var or place serviceAccountKey.json in repo root (not recommended for public repos). If you only want to run without Firebase, set FIREBASE_EMULATOR_MODE=1.");
+  process.exit(1);
+}
+
+const serviceAccount = require(SERVICE_ACCOUNT_PATH);
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
-  databaseURL: "https://monitoring-panel-77a07-default-rtdb.asia-southeast1.firebasedatabase.app/" 
+  databaseURL: process.env.FIREBASE_DATABASE_URL || "https://monitoring-panel-77a07-default-rtdb.asia-southeast1.firebasedatabase.app/"
 });
 
 const db = admin.database();
-const ref = db.ref("wiring");
+const ref = db.ref(process.env.FIREBASE_DB_REF || "wiring");
 
-app.use(cors());
-app.use(express.json());
+// CORS: origins can be set via ALLOW_ORIGINS env (comma-separated)
+const allowOrigins = process.env.ALLOW_ORIGINS ? process.env.ALLOW_ORIGINS.split(",") : ["http://localhost:5173"];
+app.use(cors({ origin: function(origin, cb) {
+  // Allow requests with no origin (curl, server-to-server)
+  if (!origin) return cb(null, true);
+  if (allowOrigins.indexOf(origin) !== -1) return cb(null, true);
+  return cb(new Error("Not allowed by CORS"));
+}}));
+app.use(express.json({ limit: "5mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 // --- 1. ENDPOINT: Ambil Data ---
-app.get("/data", (req, res) => {
-  ref.once("value", (snapshot) => {
+app.get("/data", async (req, res) => {
+  try {
+    const snapshot = await ref.once("value");
     const data = snapshot.val();
     const result = data ? Object.keys(data).map(key => ({ id: key, ...data[key] })).reverse() : [];
     res.json(result);
-  });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Gagal membaca data" });
+  }
 });
 
 // --- 2. ENDPOINT: Tambah Data Baru ---
@@ -90,7 +111,7 @@ app.get("/export-excel", (req, res) => {
     // Memasukkan data ke baris Excel
     Object.keys(data).forEach(key => {
       const item = data[key];
-      
+
       // LOGIKA CERDAS DETEKSI ANGKA/TEKS
       let rawProgress = item.progres ? String(item.progres).trim() : '0';
       let cleanVal = rawProgress.replace('%', '').trim();
@@ -105,18 +126,18 @@ app.get("/export-excel", (req, res) => {
       } else {
           finalProgress = rawProgress; // Jika teks kalimat, biarkan apa adanya (tanpa %)
       }
-      
+
       worksheet.addRow({
         nomor_project: item.nomor_project || '-',
         nama_project: item.nama_project || '-',
         panel_id: item.panel_id || '-',
-        qty_plan: 1, 
+        qty_plan: 1,
         plan_start: item.plan_start || '-',
         actual_start: item.actual_start || '-',
         plan_finish: item.plan_finish || '-',
         actual_finish: item.actual_finish || '-',
         qty_actual: qtyActual,
-        progres: finalProgress, 
+        progres: finalProgress,
         keterangan: item.keterangan || '-'
       });
     });
@@ -125,12 +146,12 @@ app.get("/export-excel", (req, res) => {
     const headerRow = worksheet.getRow(1);
     headerRow.font = { bold: true };
     headerRow.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
-    headerRow.height = 30; 
+    headerRow.height = 30;
 
     // Kode Warna Hexadecimal
-    const fillBlue = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF00B0F0' } }; 
-    const fillYellow = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFFF00' } }; 
-    const fillGreen = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF92D050' } }; 
+    const fillBlue = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF00B0F0' } };
+    const fillYellow = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFFF00' } };
+    const fillGreen = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF92D050' } };
 
     [1, 2, 3].forEach(col => headerRow.getCell(col).fill = fillBlue);
     [4, 5, 6].forEach(col => headerRow.getCell(col).fill = fillYellow);
@@ -162,6 +183,36 @@ ref.on("value", () => {
   io.emit("updateData");
 });
 
-server.listen(3000, "0.0.0.0", () => {
-  console.log("Server Berjalan di Port 3000");
+// --- PROXY: meneruskan request ke WordPress Headless API ---
+const WP_API_BASE = process.env.WP_API_BASE || "https://admin.aryatek.co.id/wp-json/wp/v2";
+
+app.use("/wp", async (req, res) => {
+  const targetBase = WP_API_BASE.replace(/\/$/, "");
+  const targetUrl = targetBase + req.originalUrl.replace(/^\/wp/, "");
+  try {
+    const init = {
+      method: req.method,
+      headers: { ...req.headers, host: new URL(targetBase).host },
+      body: ["GET", "HEAD"].includes(req.method) ? undefined : JSON.stringify(req.body),
+    };
+    const wpRes = await fetch(targetUrl, init);
+    res.status(wpRes.status);
+    wpRes.headers.forEach((value, name) => {
+      if (!["transfer-encoding", "content-encoding", "content-length", "connection"].includes(name.toLowerCase())) {
+        res.setHeader(name, value);
+      }
+    });
+    const buffer = await wpRes.arrayBuffer();
+    res.send(Buffer.from(buffer));
+  } catch (err) {
+    console.error("Proxy error:", err);
+    res.status(502).json({ error: "Bad gateway" });
+  }
+});
+
+// Health check
+app.get("/health", (req, res) => res.json({ status: "ok" }));
+
+server.listen(process.env.PORT || 3000, "0.0.0.0", () => {
+  console.log("Server Berjalan di Port", process.env.PORT || 3000);
 });
